@@ -1,0 +1,122 @@
+name: validate
+
+# Two claims, and the second is the reason this workflow exists:
+#   1. the manifests are valid JSON and name what they say they name
+#   2. every vendored file still matches its source at the recorded ref
+#
+# The second is the whole risk of this repository. It carries copies, and a copy that
+# drifts from its source is exactly the failure the architecture it distributes was
+# built to remove.
+on:
+  push: { branches: [main] }
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  manifests:
+    name: manifests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # `claude plugin validate` is not run here: the CLI is not on the runner and
+      # installing it would add a dependency this repository does not otherwise have.
+      # It is the local, human-run complement — see README.md.
+      - name: manifests are valid JSON
+        run: |
+          for f in .claude-plugin/marketplace.json .claude-plugin/plugin.json .plugin-source.json; do
+            python3 -c "import json,sys;json.load(open(sys.argv[1]))" "$f"
+            echo "✅ $f"
+          done
+
+      - name: the marketplace points at a plugin that exists here
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          mk = json.load(open(".claude-plugin/marketplace.json"))
+          pl = json.load(open(".claude-plugin/plugin.json"))
+          fail = 0
+          for entry in mk["plugins"]:
+              src = entry["source"]
+              if not isinstance(src, str):
+                  continue                       # a remote source is not ours to check
+              root = os.path.normpath(src)
+              manifest = os.path.join(root, ".claude-plugin", "plugin.json")
+              if not os.path.isfile(manifest):
+                  print(f"❌ {entry['name']}: no plugin.json at {manifest}"); fail = 1
+              elif json.load(open(manifest))["name"] != entry["name"]:
+                  print(f"❌ {entry['name']}: plugin.json calls itself "
+                        f"{json.load(open(manifest))['name']}"); fail = 1
+          # `.claude-plugin/` holds manifests only — a skill placed inside it is loaded
+          # by nothing, silently.
+          for stray in ("skills", "agents", "hooks"):
+              if os.path.isdir(os.path.join(".claude-plugin", stray)):
+                  print(f"❌ .claude-plugin/{stray}/ — only plugin.json belongs there"); fail = 1
+          if not fail:
+              print(f"✅ {len(mk['plugins'])} plugin(s), each with a matching manifest")
+          sys.exit(fail)
+          PY
+
+      - name: every skill the plugin ships has frontmatter with a name and a description
+        run: |
+          FAIL=0
+          for f in skills/*/SKILL.md; do
+            head -1 "$f" | grep -q '^---$' || { echo "❌ $f has no frontmatter"; FAIL=1; continue; }
+            grep -q '^name:' "$f" || { echo "❌ $f has no name:"; FAIL=1; }
+            grep -q '^description:' "$f" || { echo "❌ $f has no description:"; FAIL=1; }
+            dir=$(basename "$(dirname "$f")")
+            grep -q "^name: $dir\$" "$f" || {
+              echo "❌ $f: name: does not match its directory ($dir)"; FAIL=1; }
+          done
+          [ "$FAIL" -eq 0 ] && echo "✅ Every shipped skill declares itself correctly."
+          exit $FAIL
+
+  vendored-copies:
+    name: vendored copies match their source
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # A private source needs a token with read access to it; the repository secret is
+      # optional, and without it this job is skipped rather than failing with a 404 that
+      # reads like drift.
+      - name: fetch each source file and diff
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_READ_TOKEN }}
+        run: |
+          REF=$(python3 -c 'import json;print(json.load(open(".plugin-source.json"))["ref"])')
+          RAW=$(python3 -c 'import json;print(json.load(open(".plugin-source.json"))["raw_url"])')
+          HEADER=()
+          [ -n "${GH_TOKEN:-}" ] && HEADER=(-H "Authorization: Bearer $GH_TOKEN")
+          FAIL=0
+          while read -r local remote; do
+            url="${RAW/\{ref\}/$REF}"; url="${url/\{path\}/$remote}"
+            if ! curl -sS --fail --retry 3 --max-time 60 -L "${HEADER[@]}" "$url" -o /tmp/src; then
+              echo "⚠️  could not fetch $remote @ $REF — set the SOURCE_READ_TOKEN secret"
+              echo "    if the source repository is private. Not treated as drift."
+              exit 0
+            fi
+            if ! diff -u "$local" /tmp/src > /tmp/d.txt; then
+              echo "❌ $local differs from $remote @ $REF — run ./sync.sh and commit"
+              head -40 /tmp/d.txt
+              FAIL=1
+            else
+              echo "✅ $local matches $remote @ $REF"
+            fi
+          done < <(python3 -c 'import json;[print(k,v) for k,v in json.load(open(".plugin-source.json"))["files"].items()]')
+          exit $FAIL

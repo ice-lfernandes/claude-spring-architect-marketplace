@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "claude-spring-architect",
+  "description": "Delivery vehicle for the claude-spring-architect architecture: one skill that installs its norms, development skills, agents and hooks into an existing Java project, and updates them later.",
+  "owner": {
+    "name": "Lucas Fernandes",
+    "url": "https://github.com/ice-lfernandes"
+  },
+  "plugins": [
+    {
+      "name": "spring-architect",
+      "description": "Install or update the claude-spring-architect `.claude/` inside a Java project — norms with globs derived for the project's own packages, development skills, agents, and the enforcement hook.",
+      "source": "./",
+      "category": "productivity"
+    }
+  ]
+}
