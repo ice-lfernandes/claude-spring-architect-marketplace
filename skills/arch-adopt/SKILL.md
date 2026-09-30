@@ -8,7 +8,8 @@ description: >
   newer version. Explicit invocation only.
 argument-hint: "[--ref <tag|sha|main>] [--source <local path>] [--blueprint <id>]"
 disable-model-invocation: true
-allowed-tools: Read, Write, Edit, Bash, Glob, AskUserQuestion
+allowed-tools: Read, Write, Edit, Bash, Glob, AskUserQuestion, Skill
+model: opus
 ---
 
 # Arch Adopt
@@ -170,6 +171,19 @@ it reads a JSON payload from stdin and waits for one when nothing closes it. `ex
 compares the stamp's per-file digests, so anything it lists right after an export is
 something the export could not write. Do **not** commit: the diff is the user's review.
 
+### 7 · SonarQube, when the project has none
+
+Grep the root build file for the scanner: `sonar-maven-plugin` in `pom.xml`,
+`org.sonarqube` in `build.gradle`. Found → skip this step and say "already configured" in
+the report. Not found → invoke `sonarqube-setup` through the `Skill` tool; it asks its own
+question (an existing server, or a local container) and writes outside `.claude/` under
+its own territory, not this skill's. This skill still writes nothing but `.claude/`.
+
+On an **install** the skill did not exist when the session started — `.claude/skills/`
+was created by step 5 — so the runtime has not listed it yet. Ask the user to run
+`/reload-skills`, then invoke it; on an update it is picked up live. Only schema exit 0
+reaches this step: a broken `.claude/` is reported first.
+
 ## Report
 
 ```
@@ -180,6 +194,7 @@ Files ........ <n> written · <n> unchanged · <n> overwritten
 Warnings ..... <none | the surviving-citation lines, verbatim>
 Schema ....... <exit 0 | the failure>
 Provenance ... <the doctor line>
+SonarQube .... <already configured | configured by sonarqube-setup — <its first line> | pending: run /reload-skills, then /sonarqube-setup>
 
 Review: git diff · Undo: git checkout -- .claude
 Next: /arch-doctor for the full diagnosis
@@ -200,11 +215,15 @@ The transformation itself is deliberately **not** here — it is `ArchHook.java 
 Form 7c, because it runs unattended on other people's machines and the same input has to
 produce the same tree.
 
+Pinned to `opus`: it merges into a project it did not write, and may write the only copy of that project's blueprint (`@.claude/decisions/0081-skill-model-required-per-class.md`).
+
 ## Contract
 
 **Class:** build — the territory is `skill_classes.build`'s override for this skill in
 `@.claude/schemas/extensions.json`: the target project's `.claude/` tree and its
 `.gitignore`, nothing else. `ArchHook.java guard` enforces it.
+
+**Unfiltered Bash:** adoption fetches the source (`git ls-remote`, `curl`, `tar`), inspects the worktree (`git status`, `git rev-parse`, `find`), and runs `java … export` — spread over two tools that fetch from the network and a command list that grows with the source's layout. Writes stay under `guard`/`guard bash`, and a force push is blocked by `guard bash` (`guard.force_push`).
 
 **Reads** `.claude/schemas/extensions.json` (the `source` block — never a URL from
 memory), `.claude/.arch-provenance.json` when it exists, `src/main/java/**` to detect the
@@ -220,5 +239,9 @@ cannot authenticate. Never prints the value of `source.auth_env`, and never comm
 **Travels into the project** — unlike `project-bootstrap` and `init-project`, which only
 serve before the project exists. This one is how a project updates itself once the plugin
 that delivered it is gone, so it is in `export.skills.include`.
+
+**Chains** `sonarqube-setup` in step 7 when the build file has no scanner — the one
+piece of this procedure that writes outside `.claude/`, and it does so under that skill's
+territory, never this one's.
 
 **Hands off to** `/arch-doctor` for the diagnosis, and to the user for the diff.
