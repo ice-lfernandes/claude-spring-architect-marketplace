@@ -1,0 +1,175 @@
+name: sync
+
+# One claim: every tag the source repository cuts arrives here as a pull request that
+# already passed `validate.yml` — and nothing reaches `main` without someone merging it.
+#
+#   prepare   resolves the ref, runs `./sync.sh <ref>`, sets the plugin version to match,
+#             and pushes branch `sync/<ref>`. Exits quietly when there is nothing to do.
+#   validate  `validate.yml`, called on that branch. Called and not left to trigger: the
+#             branch is pushed with GITHUB_TOKEN, which starts no workflow, so the PR it
+#             becomes would otherwise carry no check of its own.
+#   pr        opens the PR once the branch validated. The merge is the decision about
+#             what to publish; this workflow automates the copy, never that decision.
+#
+# Triggered by `release.yml` in the source repository right after it pushes a tag
+# (`repository_dispatch`, type `source-released`, payload `{"ref": "vX.Y.Z"}`), and by
+# hand with `workflow_dispatch` — an empty ref there means the latest tag.
+#
+# Needs "Allow GitHub Actions to create and approve pull requests" ticked in Settings →
+# Actions → General. Without it, `pr` fails with a 403 and the validated branch stays.
+on:
+  repository_dispatch:
+    types: [source-released]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Source tag to sync (vX.Y.Z). Empty means the latest tag.
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+# Serialized and never cancelled: two tags seconds apart each get their own branch, and a
+# cancelled run could leave a pushed branch with no PR behind it.
+concurrency:
+  group: sync
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: sync the vendored copy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      ref: ${{ steps.resolve.outputs.ref }}
+      branch: ${{ steps.resolve.outputs.branch }}
+      current: ${{ steps.resolve.outputs.current }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: resolve the ref
+        id: resolve
+        # The payload is passed through the environment, never interpolated into the
+        # script: whoever can dispatch chooses its text.
+        env:
+          WANTED: ${{ github.event.client_payload.ref || inputs.ref }}
+        run: |
+          set -euo pipefail
+          SRC=.plugin-source.json
+          GIT_URL=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["git_url"])' "$SRC")
+          CURRENT=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["ref"])' "$SRC")
+          # A public source needs no token to list its tags.
+          TAGS=$(git ls-remote --tags --refs "$GIT_URL" 'v*' \
+            | sed 's#.*refs/tags/##' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V)
+          REF=${WANTED:-$(printf '%s\n' "$TAGS" | tail -1)}
+          if ! [[ "$REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "❌ '$REF' is not vMAJOR.MINOR.PATCH."; exit 1
+          fi
+          if ! grep -qxF "$REF" <<< "$TAGS"; then
+            echo "❌ $REF is not a tag of $GIT_URL."; exit 1
+          fi
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          if [ "$REF" = "$CURRENT" ]; then
+            echo "✅ $REF is already the recorded ref. Nothing to sync."; exit 0
+          fi
+          # `sort -V`, not string order: v0.9.0 must not outrank v0.10.0.
+          if [ "$(printf '%s\n%s\n' "$CURRENT" "$REF" | sort -V | tail -1)" != "$REF" ]; then
+            echo "✅ $REF is older than the recorded $CURRENT. A downgrade is a manual decision."
+            exit 0
+          fi
+          BRANCH="sync/$REF"
+          if git ls-remote --exit-code --heads origin "$BRANCH" > /dev/null; then
+            echo "✅ $BRANCH already exists: its PR is open, or its validation failed."
+            echo "   Delete the branch and re-run this workflow to try again."
+            exit 0
+          fi
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "▶ $CURRENT → $REF on $BRANCH"
+
+      - name: sync, set the version, push the branch
+        if: steps.resolve.outputs.branch != ''
+        env:
+          REF: ${{ steps.resolve.outputs.ref }}
+          BRANCH: ${{ steps.resolve.outputs.branch }}
+          CURRENT: ${{ steps.resolve.outputs.current }}
+        run: |
+          set -euo pipefail
+          git switch -c "$BRANCH"
+          ./sync.sh "$REF"
+          # The plugin version is the source tag without its `v`, the same number a person
+          # bumped by hand before this workflow existed.
+          python3 - "${REF#v}" <<'PY'
+          import json, sys
+          p = ".claude-plugin/plugin.json"
+          d = json.load(open(p))
+          d["version"] = sys.argv[1]
+          json.dump(d, open(p, "w"), indent=2, ensure_ascii=False)
+          open(p, "a").write("\n")
+          PY
+          git add -A
+          CHANGED=$(git diff --cached --name-only -- skills/)
+          {
+            printf 'chore: sync the vendored skill to %s\n\n' "$REF"
+            printf 'The source repository is at %s; `.plugin-source.json` recorded %s.\n' "$REF" "$CURRENT"
+            if [ -z "$CHANGED" ]; then
+              printf 'The vendored files are byte-identical between the two refs, so only the\n'
+              printf 'recorded ref and the plugin version move.\n'
+            else
+              printf 'Vendored files that changed:\n\n'
+              printf -- '- `%s`\n' $CHANGED
+            fi
+          } > "$RUNNER_TEMP/msg.txt"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -q -F "$RUNNER_TEMP/msg.txt"
+          git push -q origin "$BRANCH"
+          git show --stat HEAD
+
+  validate:
+    name: validate the branch
+    needs: prepare
+    if: needs.prepare.outputs.branch != ''
+    uses: ./.github/workflows/validate.yml
+    with:
+      ref: ${{ needs.prepare.outputs.branch }}
+    secrets: inherit
+
+  pr:
+    name: open the pull request
+    needs: [prepare, validate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: gh pr create
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ needs.prepare.outputs.ref }}
+          BRANCH: ${{ needs.prepare.outputs.branch }}
+          CURRENT: ${{ needs.prepare.outputs.current }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SOURCE_URL: https://github.com/${{ github.repository_owner }}/claude-spring-architect
+        run: |
+          set -euo pipefail
+          {
+            printf 'Syncs the vendored copy from `%s` to `%s`.\n\n' "$CURRENT" "$REF"
+            printf 'Source changes: %s/compare/%s...%s\n\n' "$SOURCE_URL" "$CURRENT" "$REF"
+            printf '`validate.yml` already passed on this branch, inside the run that opened\n'
+            printf 'this PR: %s\n\n' "$RUN_URL"
+            printf 'No check shows below because the branch was pushed with `GITHUB_TOKEN`,\n'
+            printf 'which starts no workflow. Merging publishes `%s` to everyone who installs\n' "$REF"
+            printf 'the plugin; closing it and deleting the branch skips this ref.\n'
+          } > "$RUNNER_TEMP/body.md"
+          gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$BRANCH" \
+            --title "chore: sync the vendored skill to $REF" --body-file "$RUNNER_TEMP/body.md"

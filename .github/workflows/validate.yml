@@ -11,6 +11,15 @@ on:
   push: { branches: [main] }
   pull_request:
   workflow_dispatch:
+  # Called by `sync.yml` on the branch it just pushed. That branch is pushed with
+  # GITHUB_TOKEN, which starts no workflow, so the PR it becomes would otherwise carry no
+  # check at all. Empty on every other trigger, where checkout takes the event's own ref.
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -29,6 +38,8 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
 
       # `claude plugin validate` is not run here: the CLI is not on the runner and
       # installing it would add a dependency this repository does not otherwise have.
@@ -91,6 +102,8 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
 
       # A private source needs a token with read access to it; the repository secret is
       # optional, and without it this job is skipped rather than failing with a 404 that
