@@ -38,6 +38,14 @@ plugin. This marketplace is how the first install happens, not a runtime depende
 
 ## Updating the vendored copy
 
+Automatic: every tag the source repository cuts reaches `.github/workflows/sync.yml` as a
+`repository_dispatch`, which runs `./sync.sh <tag>`, sets `plugin.json`'s version, runs
+`validate.yml` on the branch and opens a PR. Merging it is the publish. To sync by hand from
+GitHub, run the `sync` workflow (an empty ref means the latest tag). It needs "Allow GitHub
+Actions to create and approve pull requests" in Settings → Actions → General.
+
+Locally:
+
 ```bash
 ./sync.sh            # pull at the ref recorded in .plugin-source.json
 ./sync.sh v1.2.0     # pull at this ref and record it
